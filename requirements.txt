@@ -1,0 +1,25 @@
+# 自然言語処理
+sudachipy
+sudachidict_full
+pykakasi
+pyopenjtalk
+
+# AI / 深層学習
+tensorflow
+numpy
+pandas
+
+# Web 開発
+flask
+jinja2
+
+# データ保存（オプション）
+h5py
+
+# 可視化・評価（オプション）
+matplotlib
+scikit-learn
+
+# Jupyter環境
+jupyter
+ipykernel
