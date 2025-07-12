@@ -1,25 +1,23 @@
-# 自然言語処理
-sudachipy
-sudachidict_full
-pykakasi
-pyopenjtalk
-
-# AI / 深層学習
-tensorflow
-numpy
-pandas
+# 基本依赖
+numpy==2.2.5
+pandas==2.2.3
+matplotlib==3.10.0
+scikit-learn==1.6.1
 
 # Web 開発
-flask
-jinja2
+Flask==3.1.1
+Jinja2==3.1.6
 
-# データ保存（オプション）
-h5py
+# Jupyter用
+jupyter==1.1.1
+ipykernel==6.29.5
 
-# 可視化・評価（オプション）
-matplotlib
-scikit-learn
+# 深層学習
+tensorflow==2.19.0  
+keras==3.10.0
 
-# Jupyter環境
-jupyter
-ipykernel
+# 日本語テキスト処理
+sudachipy==0.6.10
+sudachidict-full==20250515
+pykakasi==0.96
+pyopenjtalk==0.4.1

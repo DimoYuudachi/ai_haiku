@@ -1,1 +1,34 @@
 本研究では、俳句データとして「https://haikudatabase.com/」に掲載されている作品を参考に、機械学習モデルの学習用データとして活用した。
+
+遇到的问题：使用1万首俳句，最开始的词汇表word2id包含13345个词汇，词嵌入维度（embedding dim）设置为128，LSTM单元数（lstm_units）设置为256，每一句俳句的最大序列长度设置为（自动填充至20），最后的训练数据的次元是 (96697, 20)，目标数据的次元是(96697,)
+构建的模型是Sequential模型，第一层是嵌入层 Embedding(vocab_size, embedding_dim, input_length=max_length)其中vocab_size=13345，embedding_dim=128， 	词向量层（13345个词 × 128维）
+第二层 LSTM(lstm_units, return_sequences=True, dropout=0.2),通过return_sequences=True返回完整的序列而不是最后一个
+第三层LSTM(lstm_units, dropout=0.2),
+第四层全链接Dense(lstm_units, activation='relu'),激活函数为relu
+第五层Dropout(0.3),
+最后一层 第六层 全链接Dense(vocab_size, activation='softmax')
+最后的可训练的总参数是5532065个
+
+模型学习时的设定 オプティマイザー : Adam。損失関数 : スパースカテゴリカルクロスエントロピー。メトリック : 正解率(accuracy)
+model.compile(optimizer='adam',
+              loss='sparse_categorical_crossentropy',
+              metrics=['accuracy'])
+
+第一次学习了20轮，batch_size设置为64，验证数据设置为0.1
+Epoch	Train Loss	Val Loss	Train Acc		Val Acc
+   1		6.9685		6.3698	0.1288		0.1817
+   4		5.6076		6.5261	0.2118		0.2072
+   7		5.0176		7.0718	0.2377		0.2166
+   8		4.8576		7.2930	0.2421		0.2161
+
+第四轮开始出现了过拟合，在验证数据上的学习表现开始下降。之后几轮过拟合越来越严重。
+
+
+为了改善过拟合，进行了如下的操作：
+第一：在准备word2id时，进行了频率过滤（出现次数小于3的词自动纳入word2id["<UNK>"] = 1）将vocab_size从13345降低至4370，在保证训练有质量的同时降低了学习难度和过拟合的概率
+第二：LSTM单元数从256减少至128，降低模型大小，最大序列长度设置从20降低至16（百分之99.99的数据都小于16）
+第三：模型第二层和第三层的dropout从0.2增加至0.3，第五层的dropout层从0.3升至0.4
+第四：加入早期停止（当val loss连续4次不下降就自动停止）和模型自动保存（只保存val loss最低的那一轮模型）
+结果 总参数从5532065降低至3709345
+训练结果 第五轮时模型训练达到最优（正确率29.17%，val loss 5.22%）
+
