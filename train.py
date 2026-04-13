@@ -1,203 +1,495 @@
-import numpy as np
-import matplotlib.pyplot as plt
 import pandas as pd
-import seaborn as sns
-sns.set()
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Embedding, Dropout
-from tensorflow.keras.preprocessing.sequence import pad_sequences
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
-
-# MatplotlibおよびSeabornで日本語を表示可能にする
-from matplotlib import rcParams
-rcParams['font.family'] = 'MS Gothic'
-
-# 高解像度なPNGでグラフを出力する
-import matplotlib_inline.backend_inline
-matplotlib_inline.backend_inline.set_matplotlib_formats('retina')
-
-import tensorflow as tf
-print("TensorFlow Version:", tf.__version__)
-
-from flask import Flask
-print("Flask導入された")
-
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from sudachipy import tokenizer
+from sudachipy import dictionary
+import os
+from collections import Counter
+import random
+import json
+import requests
+import gzip
 import pyopenjtalk
-import pykakasi
-from sudachipy import tokenizer, dictionary
-import pyopenjtalk
-from collections import defaultdict, Counter
-import ast
-import pickle
 
-# CSVを読み込む
-df = pd.read_csv("dataset/processed_haiku.csv", encoding="utf-8")
-print(df.head())
-print(df.isnull().sum())
+# ======================
+# 固定乱数シード
+# ======================
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
 
-# word2id辞書を準備（出現頻度によるフィルタリングあり）
-
-# すべてのトークンの出現頻度を集計
-token_counter = Counter()
-for idx, row in df.iterrows():
-    tokens = ast.literal_eval(row['Tokens'])
-    token_counter.update(tokens)
-
-# 最小出現頻度を設定
-min_freq = 2
-
-# word2idを初期化
-word2id = defaultdict(lambda: word2id["<UNK>"])
-word2id["<PAD>"] = 0
-word2id["<UNK>"] = 1
-word2id["<START>"] = 2
-word2id["<END>"] = 3
-
-# 出現頻度が min_freq 以上の単語のみ追加
-for token, freq in token_counter.items():
-    if freq >= min_freq:
-        word2id[token] = len(word2id)
-
-print(f"語彙数（フィルタリング後）: {len(word2id)}")
-
-# word2id保存
-with open("dataset/word2id.pkl", "wb") as f:
-    pickle.dump(dict(word2id), f)
-
-# id2word保存
-id2word = {v: k for k, v in word2id.items()}
-with open("dataset/id2word.pkl", "wb") as f:
-    pickle.dump(id2word, f)
-
-# word2id を使って、分かち書きされた日本語の単語を ID に変換
-haiku_ids_list = []
-error_count = 0
-
-for idx, row in df.iterrows():
-    # 分かち書きの結果を順に処理
-    tokens = ast.literal_eval(row['Tokens'])
-
-    # ID のシーケンスに変換
-    ids = [word2id[token] for token in tokens]
-    haiku_ids_list.append(ids)
-
-# 乱数シードの設定
-np.random.seed(42)
-tf.random.set_seed(42)
-
-# モデルのパラメータ
-vocab_size = len(word2id)
-embedding_dim = 128      # 词嵌入维度
-lstm_units = 128         # LSTM单元数
-max_length = 16          # 最大序列长度
-
-# 学習データの準備
-def prepare_training_data(haiku_ids_list, max_length):
-    X, y = [], []
-    
-    for haiku_ids in haiku_ids_list:
-        # すべての俳句にSTARTとENDのトークンを追加
-        sequence = [word2id["<START>"]] + haiku_ids + [word2id["<END>"]]
+# ======================
+# fastText 事前学習ベクトル
+# ======================
+def download_pretrained_vectors():
+    if not os.path.exists('ja.vec'):
+        print("fastText（日本語）ベクトルをダウンロードしています…")
+        url = "https://dl.fbaipublicfiles.com/fasttext/vectors-crawl/cc.ja.300.vec.gz"
+        response = requests.get(url, stream=True)
         
-        # スライディングウィンドウでシーケンスを作成
-        for i in range(1, len(sequence)):
-            input_seq = sequence[:i]
-            target = sequence[i]
+        with open('cc.ja.300.vec.gz', 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        
+        with gzip.open('cc.ja.300.vec.gz', 'rb') as f_in:
+            with open('ja.vec', 'wb') as f_out:
+                f_out.write(f_in.read())
+        
+        os.remove('cc.ja.300.vec.gz')
+        print("fastText の準備が完了しました。")
+    return 'ja.vec'
+
+def load_pretrained_vectors(vec_file, word_to_idx, embed_dim=300):
+    """ 語彙に合う行だけ読み込み、埋め込み行列を作る """
+    embedding = np.random.uniform(-0.25, 0.25, (len(word_to_idx), embed_dim))
+    found = 0
+
+    with open(vec_file, 'r', encoding='utf-8', errors='ignore') as f:
+        f.readline()
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) != embed_dim + 1:
+                continue
+            word = parts[0]
+            if word in word_to_idx:
+                idx = word_to_idx[word]
+                embedding[idx] = np.array(parts[1:], dtype=np.float32)
+                found += 1
+
+    print(f"fastText ベクトル一致: {found} / {len(word_to_idx)}")
+    return torch.tensor(embedding, dtype=torch.float32)
+
+# ======================
+# 設定保存
+# ======================
+def save_haiku_config(
+    config_path: str,
+    word_to_idx: dict,
+    idx_to_word: dict,
+    *,
+    embed_dim: int,
+    hidden_dim: int,
+    num_layers: int,
+    input_dropout: float,
+    layer_dropout: float,
+    max_length: int,
+    min_freq: int,
+):
+    idx_to_word_json = {str(int(k)): v for k, v in idx_to_word.items()}
+
+    cfg = {
+        "vocab_size": len(word_to_idx),
+        "word_to_idx": word_to_idx,
+        "idx_to_word": idx_to_word_json,
+        "embed_dim": embed_dim,
+        "hidden_dim": hidden_dim,
+        "num_layers": num_layers,
+        "input_dropout": input_dropout,
+        "layer_dropout": layer_dropout,
+        "max_length": max_length,
+        "min_freq": min_freq,
+        "special_tokens": {
+            "PAD": "<PAD>",
+            "UNK": "<UNK>",
+            "START": "<START>",
+            "END": "<END>",
+            "SEP": "<SEP>",
+        }
+    }
+
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+    print(f"設定ファイルを保存しました: {config_path} (vocab={len(word_to_idx)})")
+
+# ======================
+# モーラカウンタ
+# ======================
+class MoraCounter:
+    def count_mora(self, text):
+        if not text:
+            return 0
+
+        kana = pyopenjtalk.g2p(text, kana=True).replace(" ", "")
+        kana = kana.replace(" ", "")
+        small = set("ァィゥェォャュョぁぃぅぇぉゃゅょゎヮ")
+        count = 0
+        for c in kana:
+            if c in small:
+                continue
+            if ('ァ' <= c <= 'ヴ') or ('ぁ' <= c <= 'ゖ') or c == 'ー':
+                count += 1
+        return count
+
+# ======================
+# 分かち書き
+# ======================
+def tokenize_japanese(text, tok):
+    mode = tokenizer.Tokenizer.SplitMode.B
+    return [t.surface() for t in tok.tokenize(text, mode)]
+
+# ======================
+# 語彙作成
+# ======================
+def build_vocab(tokenized, min_freq=3):
+    counter = Counter()
+    for h in tokenized:
+        counter.update(h)
+
+    words = [w for w,c in counter.items() if c >= min_freq]
+
+    vocab = ['<PAD>', '<UNK>', '<START>', '<END>', '<SEP>'] + sorted(words)
+
+    w2i = {w:i for i,w in enumerate(vocab)}
+    i2w = {i: w for i, w in enumerate(vocab)}
+
+    print(f"総単語数={len(counter)}，語彙サイズ={len(vocab)}")
+    return w2i, i2w
+
+
+# ======================
+# 5-7-5 構造化データセット
+# ======================
+class StructuredHaikuDataset(Dataset):
+    def __init__(self, haikus, w2i, mora, max_length=30):
+        self.w2i = w2i
+        self.mora = mora
+        self.max_length = max_length
+        self.samples = []
+
+        for h in haikus:
+            lines = self._split_575(h)
+            if lines:
+                self.samples.append(lines)
+
+        print(f"5-7-5 として使えるサンプル数：{len(self.samples)}")
+
+    def _split_575(self, tokens):
+        text = ''.join(tokens)
+        m = self.mora.count_mora(text)
+        if m < 15 or m > 21:
+            return None
+        
+        pos = 0
+        result = []
+        targets = [5,7,5]
+
+        for t in targets:
+            cur = []
+            line_text = ""
+            last_mora = 0
+            while pos < len(tokens) and last_mora < t:
+                w = tokens[pos]
+                new_text = line_text + w
+                new_mora = self.mora.count_mora(new_text)
+                delta = new_mora - last_mora
+                if delta <= 0:
+                    pos += 1
+                    continue
+                if new_mora > t:
+                    pos += 1
+                    continue
+                
+                cur.append(w)
+                line_text = new_text
+                last_mora = new_mora
+                pos += 1
             
-            # 長さが16未満のシーケンスのみを処理
-            if len(input_seq) <= max_length:
-                X.append(input_seq)
-                y.append(target)
-    
-    return X, y
+            if last_mora != t:
+                return None
+            
+            result.append(cur)
 
-X, y = prepare_training_data(haiku_ids_list, max_length)
+        return result if len(result)==3 else None
 
-print(f"訓練データ数: {len(X)}")
-print(f"目標データ数: {len(y)}")
+    def __len__(self):
+        return len(self.samples)
 
-# データパディング
-# シーケンスを同じ長さにパディング
-print(f"シーケンスを指定した長さまでパディング {max_length}")
-X_padded = pad_sequences(X, maxlen=max_length, padding='pre')
-y_array = np.array(y)
+    def __getitem__(self, idx):
+        lines = self.samples[idx]
+        seq = ['<START>']
+        for i, line in enumerate(lines):
+            seq.extend(line)
+            if i < 2:
+                seq.append('<SEP>')
+        seq.append('<END>')
 
-print(X_padded.shape)
-print(y_array.shape)
+        ids = [self.w2i.get(w, self.w2i['<UNK>']) for w in seq]
 
-# モデルの作成
-model = Sequential([
-    Embedding(vocab_size, embedding_dim),
-    LSTM(lstm_units, return_sequences=True, dropout=0.3),
-    LSTM(lstm_units, dropout=0.3),
-    Dense(lstm_units, activation='relu'),
-    Dropout(0.4),
-    Dense(vocab_size, activation='softmax')
-])
+        if len(ids) < self.max_length:
+            pad = self.max_length - len(ids)
+            inp = ids[:-1] + [self.w2i['<PAD>']]*pad
+            tgt = ids[1:] + [self.w2i['<PAD>']]*pad
+        else:
+            inp = ids[:self.max_length]
+            tgt = ids[1:self.max_length+1]
 
-#　モデルの要約
-model.build(input_shape=(None, max_length))
-model.summary()
+        return torch.tensor(inp), torch.tensor(tgt)
 
-# 学習時の設定
-# オプティマイザー : Adam
-# 損失関数 : スパースカテゴリカルクロスエントロピー
-# メトリック : 正解率(accuracy)
-model.compile(optimizer='adam',
-              loss='sparse_categorical_crossentropy',
-              metrics=['accuracy'])
+# ======================
+# モデル
+# ======================
+class BigLSTMGenerator(nn.Module):
+    def __init__(self, vocab, embed_dim=200, hidden_dim=256, layers=2, input_dropout=0.1, layer_dropout=0.1):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab, embed_dim, padding_idx=0)
+        self.in_drop = nn.Dropout(input_dropout)
+        self.lstm = nn.LSTM(embed_dim, hidden_dim, layers,
+                            batch_first=True, dropout=layer_dropout if layers > 1 else 0.0)
+        self.fc = nn.Linear(hidden_dim, vocab)
+
+    def forward(self, x, hidden=None):
+        e = self.embedding(x)
+        e = self.in_drop(e)
+        o, hidden = self.lstm(e, hidden)
+        o = self.fc(o)
+        return o, hidden
 
 
-# 早期終了（過学習を防止するため）
-early_stop = EarlyStopping(
-    monitor='val_loss',
-    patience=4,
-    restore_best_weights=True,
-    verbose=1
-)
-
-# モデルの自動保存（検証データで最も良いモデルのみを保存）
-model_ckpt = ModelCheckpoint(
-    filepath='model/best_model.keras',
-    monitor='val_loss',
-    save_best_only=True,
-    mode='min',
-    verbose=1
-)
-
+# ======================
 # 学習
-epoch = 20
-hist = model.fit(X_padded, y_array, epochs=epoch, batch_size=64, validation_split=0.1, callbacks=[early_stop, model_ckpt])
+# ======================
+def train_model(model, train_loader, val_loader, device, epochs=1000, save_path="model/haiku_generator_best.pt", patience=10, min_delta=0.0):
+    model.to(device)
+    crit = nn.CrossEntropyLoss(ignore_index=0)
+    opt = optim.Adam(model.parameters(), lr=0.001)
 
+    best_val = float('inf')
+    bad_epochs = 0
 
-# モデルの保存
-model.save("model/final_model.keras")
+    for ep in range(epochs):
+        model.train()
+        total = 0
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
 
-hist.history
+            opt.zero_grad()
+            out, _ = model(x)
+            loss = crit(out.reshape(-1, model.fc.out_features), y.reshape(-1))
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
 
-# 損失関数の可視化
-actual_epoch = len(hist.history['loss'])
+            total += loss.item()
 
-fig = plt.figure()
-ax = fig.add_subplot(1, 1, 1)
-ax.plot(range(1, actual_epoch+1), hist.history['loss'], marker='o', label='train')
-ax.plot(range(1, actual_epoch+1), hist.history['val_loss'], marker='s', label='val')
+        train_loss = total / len(train_loader)
 
-ax.set_xlabel('epoch', fontsize=14)
-ax.set_ylabel('loss', fontsize=14)
-ax.legend()
-plt.tight_layout()
-plt.show()
+        model.eval()
+        val_total = 0
+        with torch.no_grad():
+            for x, y in val_loader:
+                x, y = x.to(device), y.to(device)
+                out, _ = model(x)
+                loss = crit(out.reshape(-1, model.fc.out_features), y.reshape(-1))
+                val_total += loss.item()
 
-# 正解率の可視化
-fig = plt.figure()
-ax = fig.add_subplot(1, 1, 1)
-ax.plot(range(1, actual_epoch+1), hist.history['accuracy'], marker='o', label='train')
-ax.plot(range(1, actual_epoch+1), hist.history['val_accuracy'], marker='s', label='val')
+        val_loss = val_total / len(val_loader)
 
-ax.set_xlabel('epoch', fontsize=14)
-ax.set_ylabel('accuracy', fontsize=14)
-ax.legend()
-plt.tight_layout()
-plt.show()
+        print(f"[エポック {ep+1}] train={train_loss:.4f}  val={val_loss:.4f}")
+
+        if val_loss < best_val - min_delta:
+            best_val = val_loss
+            bad_epochs = 0
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            torch.save(model.state_dict(), save_path)
+            print(f" ベスト更新(val={best_val:.4f})")
+        else:
+            bad_epochs += 1
+            if bad_epochs >= patience:
+                print(f" 早期終了：検証損失が {patience} エポック改善しませんでした（best={best_val:.4f}）")
+                break
+
+    print("学習終了。最良モデル:", save_path)
+    return model
+
+# ======================
+# 俳句生成
+# ======================
+def generate_haiku(model, start_word, w2i, i2w, mora, device, temperature=0.8):
+    model.eval()
+    model.to(device)
+
+    if start_word not in w2i:
+        start_word = '<START>'
+    
+    generated_tokens = [w2i['<START>']]
+    if start_word != '<START>':
+        generated_tokens.append(w2i[start_word])
+    
+    hidden = None
+    lines = [[], [], []]
+    targets = [5, 7, 5]
+    
+    for L in range(3):
+        current_mora = 0
+        if L == 0 and start_word != '<START>':
+            lines[0].append(start_word)
+            current_mora = mora.count_mora(start_word)
+        
+        max_attempts = 100
+        attempts = 0
+        
+        while current_mora < targets[L] and attempts < max_attempts:
+            attempts += 1
+            
+            x = torch.tensor([[generated_tokens[-1]]]).to(device)
+            
+            with torch.no_grad():
+                out, hidden = model(x, hidden)
+                logits = out[0, -1] / temperature
+                probs = torch.softmax(logits, dim=-1)
+            
+            special_tokens = {w2i['<PAD>'], w2i['<UNK>'], w2i['<START>'], w2i['<END>'], w2i['<SEP>']}
+            
+            for _ in range(20):
+                next_idx = torch.multinomial(probs, 1).item()
+                
+                if next_idx in special_tokens:
+                    continue
+                
+                word = i2w[next_idx]
+                word_mora = mora.count_mora(word)
+                
+                if current_mora + word_mora <= targets[L]:
+                    lines[L].append(word)
+                    generated_tokens.append(next_idx)
+                    current_mora += word_mora
+                    break
+            else:
+                top_k = torch.topk(probs, k=50)
+                for idx in top_k.indices:
+                    idx = idx.item()
+                    if idx in special_tokens:
+                        continue
+                    word = i2w[idx]
+                    word_mora = mora.count_mora(word)
+                    if word_mora > 0 and current_mora + word_mora <= targets[L]:
+                        lines[L].append(word)
+                        generated_tokens.append(idx)
+                        current_mora += word_mora
+                        break
+        
+        if current_mora == targets[L] - 1:
+            fillers = ['や', 'かな', 'けり', 'ぞ', 'や']
+            for filler in fillers:
+                if filler in w2i:
+                    lines[L].append(filler)
+                    generated_tokens.append(w2i[filler])
+                    current_mora += mora.count_mora(filler)
+                    break
+        
+        if L < 2:
+            sep_idx = w2i['<SEP>']
+            generated_tokens.append(sep_idx)
+            x = torch.tensor([[sep_idx]]).to(device)
+            with torch.no_grad():
+                _, hidden = model(x, hidden)
+    
+    result_lines = []
+    for line_tokens in lines:
+        if line_tokens:
+            result_lines.append(''.join(line_tokens))
+        else:
+            result_lines.append('...')
+    
+    return '\n'.join(result_lines)
+
+# ======================
+# メイン
+# ======================
+def main():
+    print("Sudachi 分かち書き器を初期化します…")
+    tok = dictionary.Dictionary().create()
+    mora = MoraCounter()
+
+    print("データを読み込みます…")
+    df = pd.read_csv('data/shiki_merged.csv')
+    texts = df['俳句'].tolist()
+
+    tokenized = []
+    for t in texts:
+        try:
+            tokenized.append(tokenize_japanese(t, tok))
+        except:
+            pass
+
+    print("語彙を作成します…")
+    w2i, i2w = build_vocab(tokenized, min_freq=3)
+
+    print("fastText を準備します…")
+    vec = download_pretrained_vectors()
+
+    print("fastText ベクトルを読み込みます（300次元）…")
+    emb_300 = load_pretrained_vectors(vec, w2i, embed_dim=300)
+
+    print("300次元 → 200次元へ射影します…")
+    torch.manual_seed(SEED)
+    projection = torch.randn(300, 200) * 0.01
+    torch.save(projection, "model/fasttext_proj_300to200.pt")
+    emb_200 = torch.mm(emb_300, projection)
+
+    print("5-7-5 データセットを構築します…")
+    full = StructuredHaikuDataset(tokenized, w2i, mora, max_length=30)
+
+    CONFIG_PATH = "data/haiku_config_v2.json"
+
+    EMBED_DIM = 200
+    HIDDEN_DIM = 256
+    NUM_LAYERS = 2
+    INPUT_DROPOUT = 0.1
+    LAYER_DROPOUT = 0.1
+    MAX_LENGTH = 30
+    MIN_FREQ = 3
+
+    save_haiku_config(
+    CONFIG_PATH,
+    word_to_idx=w2i,
+    idx_to_word=i2w,
+    embed_dim=EMBED_DIM,
+    hidden_dim=HIDDEN_DIM,
+    num_layers=NUM_LAYERS,
+    input_dropout=INPUT_DROPOUT,
+    layer_dropout=LAYER_DROPOUT,
+    max_length=MAX_LENGTH,
+    min_freq=MIN_FREQ,
+)
+
+    train_size = int(len(full)*0.85)
+    val_size = len(full) - train_size
+
+    train, val = torch.utils.data.random_split(full,[train_size,val_size])
+
+    train_loader = DataLoader(train,batch_size=32,shuffle=True)
+    val_loader = DataLoader(val,batch_size=32)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"デバイス: {device}")
+
+    print("モデルを作成します…")
+    model = BigLSTMGenerator(len(w2i), embed_dim=200, hidden_dim=256, layers=2, input_dropout=0.1, layer_dropout=0.1)
+    model.embedding.weight = nn.Parameter(emb_200)
+
+    print("学習を開始します…")
+    train_model(
+    model,
+    train_loader,
+    val_loader,
+    device,
+    epochs=1000,
+    save_path="model/haiku_generator_best.pt",
+    patience=10,
+    min_delta=0.0
+)
+    print("\n生成例（5-7-5）：")
+    for w in ("秋", "月", "桜"):
+        print(f"\n開始語: {w}")
+        print(generate_haiku(model, w, w2i, i2w, mora, device, temperature=0.8))
+        
+if __name__=="__main__":
+    main()

@@ -1,12 +1,26 @@
-import pickle
-import re
+import pandas as pd
+import matplotlib.pyplot as plt
 
-with open("dataset/word2id.pkl", "rb") as f:
-    word2id = pickle.load(f)
+df = pd.read_csv("/content/drive/MyDrive/ai_haiku/ai_haiku_last/generator_loss_log.csv")
 
-print("词表大小：", len(word2id))
-print("前20个词：", list(word2id.keys())[:20])
+fig = plt.figure()
+ax = fig.add_subplot(1,1,1)
 
-for word in word2id:
-    if re.match(r"^[0-9]+$", word):  # 匹配纯数字
-        print(word)
+ax.plot(df["epoch"], df["train_loss"],
+        marker='o', label='train')
+
+ax.plot(df["epoch"], df["val_loss"],
+        marker='s', label='validation')
+
+best_epoch = 13
+best_val = df.loc[df.epoch==best_epoch, "val_loss"].values[0]
+
+ax.plot(best_epoch, best_val,
+        marker='^', markersize=10,
+        label='best')
+
+ax.set_xlabel('epoch', fontsize=16)
+ax.set_ylabel('loss', fontsize=16)
+ax.legend()
+
+plt.show()

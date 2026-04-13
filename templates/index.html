@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>俳句ジェネレーター</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>俳句ジェネレーター</h1>
+      <p class="subtitle">季語やキーワードを入力すると、AIが俳句を作ります</p>
+    </div>
+
+    <div class="card">
+      <label>季語 / キーワード</label>
+      <div class="input-group">
+        <input type="text" id="kigo" placeholder="例：秋、春、雪、月" value="桜">
+        <button id="generateBtn" onclick="generateHaiku()">
+          <span id="btnText">生成</span>
+        </button>
+      </div>
+
+      <div class="examples">
+        <span>おすすめ：</span>
+        <button class="example-btn" onclick="setKigo('桜')">桜</button>
+        <button class="example-btn" onclick="setKigo('燈籠')">燈籠</button>
+        <button class="example-btn" onclick="setKigo('紅葉狩')">紅葉狩</button>
+        <button class="example-btn" onclick="setKigo('夕立')">夕立</button>
+        <button class="example-btn" onclick="setKigo('紫陽花')">紫陽花</button>
+        <button class="example-btn" onclick="setKigo('草餅')">草餅</button>
+        <button class="example-btn" onclick="setKigo('陽炎')">陽炎</button>
+      </div>
+    </div>
+
+    <div class="error" id="error">
+      <div class="error-content">
+        <h3>生成に失敗しました</h3>
+        <p id="errorMsg"></p>
+      </div>
+    </div>
+
+    <div class="card result" id="result">
+      <div class="badge">生成完了</div>
+      <div id="haiku"></div>
+    </div>
+  </div>
+
+  <footer class="footer">
+    Copyright © 2026 日本電子専門学校 AIシステム科 24CA0126 DENG TENG All Rights Reserved.
+  </footer>
+
+  <script src="/static/js/main.js"></script>
+</body>
+</html>
